@@ -13,6 +13,8 @@ from .roi_heads import (
 from .rotated_fast_rcnn import RROIHeads
 from .fast_rcnn import FastRCNNOutputLayers
 
+from .hierarchical_head import HierarchicalROIHeads
+
 from . import cascade_rcnn  # isort:skip
 
 __all__ = list(globals().keys())

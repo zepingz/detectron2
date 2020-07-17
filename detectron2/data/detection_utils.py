@@ -377,6 +377,12 @@ def annotations_to_instances(annos, image_size, mask_format="polygon"):
     classes = torch.tensor(classes, dtype=torch.int64)
     target.gt_classes = classes
 
+    # Fetch gt_meta_classes if exists
+    if "meta_category_id" in annos[0].keys():
+        meta_classes = [obj["meta_category_id"] for obj in annos]
+        meta_classes = torch.tensor(meta_classes, dtype=torch.int64)
+        target.gt_meta_classes = meta_classes
+
     if len(annos) and "segmentation" in annos[0]:
         segms = [obj["segmentation"] for obj in annos]
         if mask_format == "polygon":
