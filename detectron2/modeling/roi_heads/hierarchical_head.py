@@ -45,6 +45,7 @@ class HierarchicalROIHeads(ROIHeads):
         box_pooler: ROIPooler,
         box_head: nn.Module,
         box_predictor: nn.Module,
+        num_meta_classes: int,
         mask_in_features: Optional[List[str]] = None,
         mask_pooler: Optional[ROIPooler] = None,
         mask_head: Optional[nn.Module] = None,
@@ -52,7 +53,6 @@ class HierarchicalROIHeads(ROIHeads):
         keypoint_pooler: Optional[ROIPooler] = None,
         keypoint_head: Optional[nn.Module] = None,
         train_on_pred_boxes: bool = False,
-        num_meta_classes: int = 5,
         **kwargs
     ):
         """
@@ -302,7 +302,8 @@ class HierarchicalROIHeads(ROIHeads):
                         proposals_per_image.proposal_boxes = Boxes(pred_boxes_per_image)
             return losses
         else:
-            pred_instances, _, _ = self.box_predictor.inference(predictions, proposals)
+            pred_instances, _, pred_meta_instances, _ = self.box_predictor.inference(predictions, proposals)
+            pred_instances = [pred_instances, pred_meta_instances]
 
             return pred_instances
 
@@ -574,7 +575,6 @@ class HierarchicalOutputLayers(nn.Module):
         self.hidden_fc = Linear(input_size, hidden_size)
 
         # TODO: Change this
-        num_meta_classes = 5
         self.meta_cls_score = Linear(hidden_size, num_meta_classes + 1)
         self.meta_bbox_pred = Linear(hidden_size, num_meta_classes * box_dim)
 
@@ -1124,8 +1124,6 @@ def hierarchical_inference(
             that stores the topk most confidence detections.
         kept_indices: (list[Tensor]): A list of 1D tensor of length of N, each element indicates
             the corresponding boxes/scores index in [0, Ri) from the input, for image i.
-        meta_kept_indices: (list[Tensor]): A list of 1D tensor of length of N, each element indicates
-            the corresponding boxes/scores index in [0, Ri) from the input, for image i.
     """
     result_per_image = [
         hierarchical_inference_single_image(
@@ -1141,7 +1139,7 @@ def hierarchical_inference(
         for scores_per_image, boxes_per_image, meta_scores_per_image, meta_boxes_per_image, image_shape
         in zip(scores, boxes, meta_scores, meta_boxes, image_shapes)
     ]
-    return [x[0] for x in result_per_image], [x[1] for x in result_per_image], [x[2] for x in result_per_image]
+    return [x[0] for x in result_per_image], [x[1] for x in result_per_image], [x[2] for x in result_per_image], [x[3] for x in result_per_image]
 
 
 def hierarchical_inference_single_image(
@@ -1187,6 +1185,11 @@ def hierarchical_inference_single_image(
         keep = keep[:topk_per_image]
     boxes, scores, filter_inds = boxes[keep], scores[keep], filter_inds[keep]
 
+    result = Instances(image_shape)
+    result.pred_boxes = Boxes(boxes)
+    result.scores = scores
+    result.pred_classes = filter_inds[:, 1]
+
 
     # Do the same thing above for meta_boxes and meta_scores
     meta_valid_mask = torch.isfinite(meta_boxes).all(dim=1) & torch.isfinite(meta_scores).all(dim=1)
@@ -1216,17 +1219,11 @@ def hierarchical_inference_single_image(
     meta_keep = batched_nms(meta_boxes, meta_scores, meta_filter_inds[:, 1], nms_thresh)
     if topk_per_image >= 0:
         meta_keep = meta_keep[:topk_per_image]
-    meta_boxes, meta_scores, meta_filter_inds = meta_boxes[keep], meta_scores[keep], meta_filter_inds[keep]
+    meta_boxes, meta_scores, meta_filter_inds = meta_boxes[meta_keep], meta_scores[meta_keep], meta_filter_inds[meta_keep]
 
+    meta_result = Instances(image_shape)
+    meta_result.pred_meta_boxes = Boxes(meta_boxes)
+    meta_result.meta_scores = meta_scores
+    meta_result.pred_meta_classes = meta_filter_inds[:, 1]
 
-    result = Instances(image_shape)
-
-    result.pred_boxes = Boxes(boxes)
-    result.scores = scores
-    result.pred_classes = filter_inds[:, 1]
-
-    result.pred_meta_boxes = Boxes(meta_boxes)
-    result.meta_scores = meta_scores
-    result.meta_pred_classes = meta_filter_inds[:, 1]
-
-    return result, filter_inds[:, 0], meta_filter_inds[:, 0]
+    return result, filter_inds[:, 0], meta_result, meta_filter_inds[:, 0]

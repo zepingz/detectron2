@@ -352,7 +352,7 @@ class Visualizer:
         )
         self._instance_mode = instance_mode
 
-    def draw_instance_predictions(self, predictions):
+    def draw_instance_predictions(self, predictions, draw_meta=False):
         """
         Draw instance-level prediction results on an image.
 
@@ -364,10 +364,16 @@ class Visualizer:
         Returns:
             output (VisImage): image object with visualizations.
         """
-        boxes = predictions.pred_boxes if predictions.has("pred_boxes") else None
-        scores = predictions.scores if predictions.has("scores") else None
-        classes = predictions.pred_classes if predictions.has("pred_classes") else None
-        labels = _create_text_labels(classes, scores, self.metadata.get("thing_classes", None))
+        if draw_meta:
+            boxes = predictions.pred_meta_boxes if predictions.has("pred_meta_boxes") else None
+            scores = predictions.meta_scores if predictions.has("meta_scores") else None
+            classes = predictions.pred_meta_classes if predictions.has("pred_meta_classes") else None
+            labels = _create_text_labels(classes, scores, self.metadata.get("meta_thing_classes", None))
+        else:
+            boxes = predictions.pred_boxes if predictions.has("pred_boxes") else None
+            scores = predictions.scores if predictions.has("scores") else None
+            classes = predictions.pred_classes if predictions.has("pred_classes") else None
+            labels = _create_text_labels(classes, scores, self.metadata.get("thing_classes", None))
         keypoints = predictions.pred_keypoints if predictions.has("pred_keypoints") else None
 
         if predictions.has("pred_masks"):
@@ -497,7 +503,7 @@ class Visualizer:
 
         return self.output
 
-    def draw_dataset_dict(self, dic):
+    def draw_dataset_dict(self, dic, draw_meta=False):
         """
         Draw annotations/segmentaions in Detectron2 Dataset format.
 
@@ -520,14 +526,19 @@ class Visualizer:
                 keypts = None
 
             boxes = [BoxMode.convert(x["bbox"], x["bbox_mode"], BoxMode.XYXY_ABS) for x in annos]
-
-            labels = [x["category_id"] for x in annos]
+            if draw_meta:
+                labels = [x["meta_category_id"] for x in annos]
+                names = self.metadata.get("meta_thing_classes", None)
+            else:
+                labels = [x["category_id"] for x in annos]
+                names = self.metadata.get("thing_classes", None)
             colors = None
             if self._instance_mode == ColorMode.SEGMENTATION and self.metadata.get("thing_colors"):
                 colors = [
                     self._jitter([x / 255 for x in self.metadata.thing_colors[c]]) for c in labels
                 ]
-            names = self.metadata.get("thing_classes", None)
+
+            # names = self.metadata.get("thing_classes", None)
             if names:
                 labels = [names[i] for i in labels]
             labels = [

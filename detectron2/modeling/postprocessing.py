@@ -50,6 +50,8 @@ def detector_postprocess(results, output_height, output_width, mask_threshold=0.
         output_boxes = results.pred_boxes
     elif results.has("proposal_boxes"):
         output_boxes = results.proposal_boxes
+    elif results.has("pred_meta_boxes"):
+        output_boxes = results.pred_meta_boxes
 
     output_boxes.scale(scale_x, scale_y)
     output_boxes.clip(results.image_size)
@@ -67,10 +69,6 @@ def detector_postprocess(results, output_height, output_width, mask_threshold=0.
     if results.has("pred_keypoints"):
         results.pred_keypoints[:, :, 0] *= scale_x
         results.pred_keypoints[:, :, 1] *= scale_y
-
-    if results.has("pred_meta_boxes"):
-        results.pred_meta_boxes.scale(scale_x, scale_y)
-        results.pred_meta_boxes.clip(results.image_size)
 
     return results
 
