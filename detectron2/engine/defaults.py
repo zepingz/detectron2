@@ -214,6 +214,7 @@ class DefaultPredictor:
 
             inputs = {"image": image, "height": height, "width": width}
             predictions = self.model([inputs])[0]
+
             return predictions
 
 

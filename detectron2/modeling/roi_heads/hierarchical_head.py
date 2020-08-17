@@ -234,7 +234,8 @@ class HierarchicalROIHeads(ROIHeads):
             pred_instances = self._forward_box(features, proposals)
             # During inference cascaded prediction is used: the mask and keypoints heads are only
             # applied to the top scoring box detections.
-            pred_instances = self.forward_with_given_boxes(features, pred_instances)
+            # pred_instances = self.forward_with_given_boxes(features, pred_instances)
+
             return pred_instances, {}
 
     def forward_with_given_boxes(
@@ -301,8 +302,77 @@ class HierarchicalROIHeads(ROIHeads):
                         proposals_per_image.proposal_boxes = Boxes(pred_boxes_per_image)
             return losses
         else:
-            pred_instances, _ = self.box_predictor.inference(predictions, proposals)
+            pred_instances, _, _ = self.box_predictor.inference(predictions, proposals)
+
             return pred_instances
+
+    def _forward_mask(
+        self, features: Dict[str, torch.Tensor], instances: List[Instances]
+    ) -> Union[Dict[str, torch.Tensor], List[Instances]]:
+        """
+        Forward logic of the mask prediction branch.
+
+        Args:
+            features (dict[str, Tensor]): mapping from feature map names to tensor.
+                Same as in :meth:`ROIHeads.forward`.
+            instances (list[Instances]): the per-image instances to train/predict masks.
+                In training, they can be the proposals.
+                In inference, they can be the predicted boxes.
+
+        Returns:
+            In training, a dict of losses.
+            In inference, update `instances` with new fields "pred_masks" and return it.
+        """
+        if not self.mask_on:
+            return {} if self.training else instances
+
+        features = [features[f] for f in self.mask_in_features]
+
+        if self.training:
+            # The loss is only defined on positive proposals.
+            proposals, _ = select_foreground_proposals(instances, self.num_classes)
+            proposal_boxes = [x.proposal_boxes for x in proposals]
+            mask_features = self.mask_pooler(features, proposal_boxes)
+            return self.mask_head(mask_features, proposals)
+        else:
+            pred_boxes = [x.pred_boxes for x in instances]
+            mask_features = self.mask_pooler(features, pred_boxes)
+            return self.mask_head(mask_features, instances)
+
+    def _forward_keypoint(
+        self, features: Dict[str, torch.Tensor], instances: List[Instances]
+    ) -> Union[Dict[str, torch.Tensor], List[Instances]]:
+        """
+        Forward logic of the keypoint prediction branch.
+
+        Args:
+            features (dict[str, Tensor]): mapping from feature map names to tensor.
+                Same as in :meth:`ROIHeads.forward`.
+            instances (list[Instances]): the per-image instances to train/predict keypoints.
+                In training, they can be the proposals.
+                In inference, they can be the predicted boxes.
+
+        Returns:
+            In training, a dict of losses.
+            In inference, update `instances` with new fields "pred_keypoints" and return it.
+        """
+        if not self.keypoint_on:
+            return {} if self.training else instances
+
+        features = [features[f] for f in self.keypoint_in_features]
+
+        if self.training:
+            # The loss is defined on positive proposals with >=1 visible keypoints.
+            proposals, _ = select_foreground_proposals(instances, self.num_classes)
+            proposals = select_proposals_with_visible_keypoints(proposals)
+            proposal_boxes = [x.proposal_boxes for x in proposals]
+
+            keypoint_features = self.keypoint_pooler(features, proposal_boxes)
+            return self.keypoint_head(keypoint_features, proposals)
+        else:
+            pred_boxes = [x.pred_boxes for x in instances]
+            keypoint_features = self.keypoint_pooler(features, pred_boxes)
+            return self.keypoint_head(keypoint_features, instances)
 
     def _sample_proposals(
         self,
@@ -512,7 +582,7 @@ class HierarchicalOutputLayers(nn.Module):
         nn.init.normal_(self.bbox_pred.weight, std=0.001)
         nn.init.normal_(self.meta_cls_score.weight, std=0.01)
         nn.init.normal_(self.meta_bbox_pred.weight, std=0.001)
-        nn.init.normal_(self.hidden_fc.weight, std=0.001)
+        nn.init.normal_(self.hidden_fc.weight, std=0.001) # Note: Why 0.001 or 0.01?
 
         layer_list = [
             self.cls_score,
@@ -531,7 +601,11 @@ class HierarchicalOutputLayers(nn.Module):
         self.test_topk_per_image = test_topk_per_image
         self.box_reg_loss_type = box_reg_loss_type
         if isinstance(loss_weight, float):
-            loss_weight = {"loss_cls": loss_weight, "loss_box_reg": loss_weight}
+            loss_weight = {
+                "loss_cls": loss_weight,
+                "loss_box_reg": loss_weight,
+                "loss_meta_cls": loss_weight,
+                "loss_meta_box_reg": loss_weight,}
         self.loss_weight = loss_weight
 
     @classmethod
@@ -600,12 +674,14 @@ class HierarchicalOutputLayers(nn.Module):
         """
         boxes = self.predict_boxes(predictions, proposals)
         scores = self.predict_probs(predictions, proposals)
-        meta_boxes = self.meta_predict_boxes(predictions, proposals)
+        meta_boxes = self.predict_meta_boxes(predictions, proposals)
         meta_scores = self.predict_meta_probs(predictions, proposals)
         image_shapes = [x.image_size for x in proposals]
-        return fast_rcnn_inference(
+        return hierarchical_inference(
             boxes,
             scores,
+            meta_boxes,
+            meta_scores,
             image_shapes,
             self.test_score_thresh,
             self.test_nms_thresh,
@@ -681,12 +757,12 @@ class HierarchicalOutputLayers(nn.Module):
         """
         if not len(proposals):
             return []
-        _, _, _, proposal_deltas = predictions
+        _, _, _, proposal_meta_deltas = predictions
         num_prop_per_image = [len(p) for p in proposals]
         proposal_boxes = [p.proposal_boxes for p in proposals]
         proposal_boxes = proposal_boxes[0].cat(proposal_boxes).tensor
         predict_boxes = self.box2box_transform.apply_deltas(
-            proposal_deltas, proposal_boxes
+            proposal_meta_deltas, proposal_boxes
         )  # Nx(KxB)
         return predict_boxes.split(num_prop_per_image)
 
@@ -697,9 +773,9 @@ class HierarchicalOutputLayers(nn.Module):
                 Element i has shape (Ri, K + 1), where Ri is the number of predicted objects
                 for image i.
         """
-        _, _, scores, _ = predictions
+        _, _, meta_scores, _ = predictions
         num_inst_per_image = [len(p) for p in proposals]
-        probs = F.softmax(scores, dim=-1)
+        probs = F.softmax(meta_scores, dim=-1)
         return probs.split(num_inst_per_image, dim=0)
 
 
@@ -960,14 +1036,14 @@ class HierarchicalOutputs:
         loss_box_reg = loss_box_reg / self.gt_meta_classes.numel()
         return loss_box_reg
 
-    def _predict_boxes(self):
-        """
-        Returns:
-            Tensor: A Tensors of predicted class-specific or class-agnostic boxes
-                for all images in a batch. Element i has shape (Ri, K * B) or (Ri, B), where Ri is
-                the number of predicted objects for image i and B is the box dimension (4 or 5)
-        """
-        return self.box2box_transform.apply_deltas(self.pred_proposal_deltas, self.proposals.tensor)
+    # def _predict_boxes(self):
+    #     """
+    #     Returns:
+    #         Tensor: A Tensors of predicted class-specific or class-agnostic boxes
+    #             for all images in a batch. Element i has shape (Ri, K * B) or (Ri, B), where Ri is
+    #             the number of predicted objects for image i and B is the box dimension (4 or 5)
+    #     """
+    #     return self.box2box_transform.apply_deltas(self.pred_proposal_deltas, self.proposals.tensor)
 
     """
     A subclass is expected to have the following methods because
@@ -992,36 +1068,38 @@ class HierarchicalOutputs:
 
         return losses_dict
 
-    def predict_boxes(self):
-        """
-        Deprecated
-        """
-        return self._predict_boxes().split(self.num_preds_per_image, dim=0)
-
-    def predict_probs(self):
-        """
-        Deprecated
-        """
-        probs = F.softmax(self.pred_class_logits, dim=-1)
-        return probs.split(self.num_preds_per_image, dim=0)
-
-    def inference(self, score_thresh, nms_thresh, topk_per_image):
-        """
-        Deprecated
-        """
-        boxes = self.predict_boxes()
-        scores = self.predict_probs()
-        image_shapes = self.image_shapes
-        return fast_rcnn_inference(
-            boxes, scores, image_shapes, score_thresh, nms_thresh, topk_per_image
-        )
+    # def predict_boxes(self):
+    #     """
+    #     Deprecated
+    #     """
+    #     return self._predict_boxes().split(self.num_preds_per_image, dim=0)
+    #
+    # def predict_probs(self):
+    #     """
+    #     Deprecated
+    #     """
+    #     probs = F.softmax(self.pred_class_logits, dim=-1)
+    #     return probs.split(self.num_preds_per_image, dim=0)
+    #
+    # def inference(self, score_thresh, nms_thresh, topk_per_image):
+    #     """
+    #     Deprecated
+    #     """
+    #     boxes = self.predict_boxes()
+    #     scores = self.predict_probs()
+    #     image_shapes = self.image_shapes
+    #     return fast_rcnn_inference(
+    #         boxes, scores, image_shapes, score_thresh, nms_thresh, topk_per_image
+    #     )
 
 
 ###############################################################################
 ##### Inference class
 ###############################################################################
 
-def hierarchical_inference(boxes, scores, image_shapes, score_thresh, nms_thresh, topk_per_image):
+def hierarchical_inference(
+    boxes, scores, meta_boxes, meta_scores, image_shapes, score_thresh, nms_thresh, topk_per_image
+):
     """
     Call `hierarchical_inference_single_image` for all images.
 
@@ -1046,18 +1124,28 @@ def hierarchical_inference(boxes, scores, image_shapes, score_thresh, nms_thresh
             that stores the topk most confidence detections.
         kept_indices: (list[Tensor]): A list of 1D tensor of length of N, each element indicates
             the corresponding boxes/scores index in [0, Ri) from the input, for image i.
+        meta_kept_indices: (list[Tensor]): A list of 1D tensor of length of N, each element indicates
+            the corresponding boxes/scores index in [0, Ri) from the input, for image i.
     """
     result_per_image = [
         hierarchical_inference_single_image(
-            boxes_per_image, scores_per_image, image_shape, score_thresh, nms_thresh, topk_per_image
+            boxes_per_image,
+            scores_per_image,
+            meta_boxes_per_image,
+            meta_scores_per_image,
+            image_shape,
+            score_thresh,
+            nms_thresh,
+            topk_per_image
         )
-        for scores_per_image, boxes_per_image, image_shape in zip(scores, boxes, image_shapes)
+        for scores_per_image, boxes_per_image, meta_scores_per_image, meta_boxes_per_image, image_shape
+        in zip(scores, boxes, meta_scores, meta_boxes, image_shapes)
     ]
-    return [x[0] for x in result_per_image], [x[1] for x in result_per_image]
+    return [x[0] for x in result_per_image], [x[1] for x in result_per_image], [x[2] for x in result_per_image]
 
 
 def hierarchical_inference_single_image(
-    boxes, scores, image_shape, score_thresh, nms_thresh, topk_per_image
+    boxes, scores, meta_boxes, meta_scores, image_shape, score_thresh, nms_thresh, topk_per_image
 ):
     """
     Single-image inference. Return bounding-box detection results by thresholding
@@ -1099,8 +1187,46 @@ def hierarchical_inference_single_image(
         keep = keep[:topk_per_image]
     boxes, scores, filter_inds = boxes[keep], scores[keep], filter_inds[keep]
 
+
+    # Do the same thing above for meta_boxes and meta_scores
+    meta_valid_mask = torch.isfinite(meta_boxes).all(dim=1) & torch.isfinite(meta_scores).all(dim=1)
+    if not valid_mask.all():
+        meta_boxes = meta_boxes[valid_mask]
+        meta_scores = meta_scores[valid_mask]
+
+    meta_scores = meta_scores[:, :-1]
+    num_meta_bbox_reg_classes = meta_boxes.shape[1] // 4
+    # Convert to Boxes to use the `clip` function ...
+    meta_boxes = Boxes(meta_boxes.reshape(-1, 4))
+    meta_boxes.clip(image_shape)
+    meta_boxes = meta_boxes.tensor.view(-1, num_meta_bbox_reg_classes, 4)  # R x C x 4
+
+    # Filter results based on detection scores
+    meta_filter_mask = meta_scores > score_thresh  # R x K
+    # R' x 2. First column contains indices of the R predictions;
+    # Second column contains indices of classes.
+    meta_filter_inds = meta_filter_mask.nonzero()
+    if num_meta_bbox_reg_classes == 1:
+        meta_boxes = meta_boxes[meta_filter_inds[:, 0], 0]
+    else:
+        meta_boxes = meta_boxes[meta_filter_mask]
+    meta_scores = meta_scores[meta_filter_mask]
+
+    # Apply per-class NMS
+    meta_keep = batched_nms(meta_boxes, meta_scores, meta_filter_inds[:, 1], nms_thresh)
+    if topk_per_image >= 0:
+        meta_keep = meta_keep[:topk_per_image]
+    meta_boxes, meta_scores, meta_filter_inds = meta_boxes[keep], meta_scores[keep], meta_filter_inds[keep]
+
+
     result = Instances(image_shape)
+
     result.pred_boxes = Boxes(boxes)
     result.scores = scores
     result.pred_classes = filter_inds[:, 1]
-    return result, filter_inds[:, 0]
+
+    result.pred_meta_boxes = Boxes(meta_boxes)
+    result.meta_scores = meta_scores
+    result.meta_pred_classes = meta_filter_inds[:, 1]
+
+    return result, filter_inds[:, 0], meta_filter_inds[:, 0]
