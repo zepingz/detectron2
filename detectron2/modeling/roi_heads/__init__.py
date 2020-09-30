@@ -24,6 +24,7 @@ from .rotated_fast_rcnn import RROIHeads
 from .fast_rcnn import FastRCNNOutputLayers
 
 from .hierarchical_head import HierarchicalROIHeads
+from .hierarchical_head2 import HierarchicalROIHeads2
 
 from . import cascade_rcnn  # isort:skip
 
